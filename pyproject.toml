@@ -1,0 +1,24 @@
+[project]
+name = "perpetual-latent-attention"
+version = "0.1.0"
+description = "Focuses on increasing capabilities of open source models."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv",
+    "torch>=2.8.0",
+    "transformers",
+    "hf-transfer",
+    "datasets<4.0",
+    "tptt",
+    "peft",
+    "bitsandbytes"
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
