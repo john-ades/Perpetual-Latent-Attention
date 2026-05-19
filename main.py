@@ -1,7 +1,7 @@
 import os
 import argparse
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, IterableDataset, Dataset
 from transformers import (
     AutoTokenizer,
     Trainer,
@@ -16,6 +16,34 @@ import tptt
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
+
+def packed_stream_generator(dataset_stream, tokenizer, max_length, text_column="text"):
+    """
+    Consumes the text stream, tokenizes on the fly,
+    and yields perfectly packed sequences of max_length without padding.
+    """
+    buffer = []
+
+    for row in dataset_stream:
+        # Extract text and append the EOS token to act as a document boundary
+        text = row[text_column] + tokenizer.eos_token
+
+        # Tokenize raw text without padding or truncation
+        # add_special_tokens=False because we manually appended eos_token
+        tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+        buffer.extend(tokens)
+
+        # Once our buffer is larger than max_length, yield a perfect chunk
+        while len(buffer) >= max_length:
+            chunk = buffer[:max_length]
+            buffer = buffer[max_length:]  # Keep the remainder for the next chunk
+
+            yield {
+                "input_ids": chunk,
+                "labels": chunk.copy(),
+                "attention_mask": [1] * max_length  # All 1s because there is zero padding
+            }
+
 def parse_args():
     parser = argparse.ArgumentParser(description="TPTT Training Script")
 
@@ -24,7 +52,11 @@ def parse_args():
                         help="Hugging Face model ID (e.g., Qwen/Qwen2.5-3B, mistralai/Mistral-7B-v0.3)")
     parser.add_argument("--dataset", type=str, required=True,
                         help="HuggingFace dataset name (e.g., HuggingFaceH4/ultrachat_200k)")
+    parser.add_argument("--dataset_config", type=str, default=None,
+                        help="Dataset config/subset name (e.g., sample-10BT for fineweb-edu)")
     parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use for training")
+    parser.add_argument("--train_samples", type=int, default=10000,
+                        help="Number of samples to extract from the stream for training")
     parser.add_argument("--text_column", type=str, default=None,
                         help="Explicitly specify the column name containing the text data")
     parser.add_argument("--output_dir", type=str, default="./tptt-trained-model")
@@ -134,21 +166,40 @@ def main():
     tokenizer.padding_side = "right"
 
     # ==========================================
-    # 2. Load and Prepare Dataset
+    # 2. Load and Prepare Dataset (CHUNK EXTRACTION)
     # ==========================================
-    print(f"📚 Loading dataset: {args.dataset}")
-    dataset = load_dataset(args.dataset, split=args.dataset_split)
+    print(f"🌊 Streaming dataset: {args.dataset}")
 
-    tokenized_dataset = dataset.map(
+    dataset_kwargs = {"split": args.dataset_split, "streaming": True}
+    if args.dataset_config:
+        dataset_kwargs["name"] = args.dataset_config
+
+    dataset = load_dataset(args.dataset, **dataset_kwargs)
+
+    eval_steps = 500
+    
+    print(f"📦 Extracting a chunk of {args.train_samples} training samples and {eval_steps} eval samples from the stream...")
+    # Take a chunk for eval and a chunk for train
+    eval_chunk = list(dataset.take(eval_steps))
+    train_chunk = list(dataset.skip(eval_steps).take(args.train_samples))
+
+    eval_dataset = Dataset.from_list(eval_chunk)
+    train_dataset = Dataset.from_list(train_chunk)
+
+    print("✂️ Tokenizing the extracted chunks...")
+    column_names = train_dataset.column_names
+
+    eval_dataset = eval_dataset.map(
         lambda x: format_and_tokenize(x, tokenizer, args.max_length, args.text_column),
         batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing dataset"
+        remove_columns=column_names
     )
 
-    # Generate Train/Eval split
-    split = tokenized_dataset.train_test_split(test_size=0.05, seed=42)
-    train_dataset, eval_dataset = split["train"], split["test"]
+    train_dataset = train_dataset.map(
+        lambda x: format_and_tokenize(x, tokenizer, args.max_length, args.text_column),
+        batched=True,
+        remove_columns=column_names
+    )
 
     # ==========================================
     # 3. Configure Quantization & LoRA (PEFT)
@@ -217,9 +268,11 @@ def main():
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        num_train_epochs=args.epochs,
+
+        # REMOVE num_train_epochs. ADD max_steps.
+        max_steps=10_000,  # Set this to however many update steps you want to run
+
         learning_rate=args.lr,
         weight_decay=0.01,
         bf16=not args.fp16,
@@ -227,12 +280,11 @@ def main():
         gradient_checkpointing=True,
         logging_steps=10,
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=500,
         save_strategy="steps",
-        save_steps=100,
-        save_total_limit=2,
+        save_steps=1000,
         report_to="none",
-        remove_unused_columns=False,  # Crucial: Keeps TPTT required inputs from being dropped
+        remove_unused_columns=False,
     )
 
     # Setup LiZA Callback (Memory Gate Curriculum)
