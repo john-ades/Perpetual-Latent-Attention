@@ -209,12 +209,18 @@ def main():
 
     lora_config_dict = None
     if args.use_lora:
-        # TPTT injects recurrent memory gates and mapping layers.
-        # These MUST be targeted by LoRA to learn the cache updates.
+        # 1. Target standard pre-trained modules with LoRA
         lora_targets = set(args.lora_target_modules)
-        lora_targets.update(["memory_gate", "mapping_func"])
+
+        # 🚨 FIX: Remove the line that forces LoRA onto the custom modules:
+        # lora_targets.update(["memory_gate", "mapping_func"])
+
+        # 2. Fully train the NEW injected TPTT modules without LoRA restrictions
+        modules_to_save = ["memory_gate", "mapping_func"]
 
         print(f"🔧 Configuring LoRA targeting modules: {list(lora_targets)}")
+        print(f"🔓 Fully unfreezing TPTT modules: {modules_to_save}")
+
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -222,6 +228,7 @@ def main():
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=list(lora_targets),
+            modules_to_save=modules_to_save,  # <-- ADD THIS HERE
         )
         lora_config_dict = lora_config.to_dict()
 
