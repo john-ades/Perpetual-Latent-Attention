@@ -263,6 +263,21 @@ def main():
     if len(tokenizer) > model.config.vocab_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    if hasattr(model, "tptt_model"):
+        # 1. Forward the enable/disable commands to the inner base model
+        if hasattr(model.tptt_model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable = model.tptt_model.gradient_checkpointing_enable
+        if hasattr(model.tptt_model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable = model.tptt_model.gradient_checkpointing_disable
+
+        # 2. CRITICAL FOR LORA: Ensure frozen base inputs require gradients.
+        # If the Trainer can't find this, PyTorch drops the gradients before they reach your adapters!
+        if hasattr(model.tptt_model, "enable_input_require_grads"):
+            model.enable_input_require_grads = model.tptt_model.enable_input_require_grads
+
+        # 3. Bypass any older Trainer safety checks
+        model.supports_gradient_checkpointing = True
+
     # ==========================================
     # 5. Setup Training Arguments & Callbacks
     # ==========================================
