@@ -10,6 +10,7 @@ dependencies = [
     "transformers",
     "hf-transfer",
     "datasets<4.0",
+    "accelerate",
     "tptt",
     "peft",
     "bitsandbytes"

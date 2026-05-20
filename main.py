@@ -1,5 +1,8 @@
 import os
 import argparse
+# Prevent memory fragmentation in PyTorch during long context training (must be set before torch import)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from datasets import load_dataset, IterableDataset, Dataset
 from transformers import (
@@ -12,8 +15,6 @@ from transformers import (
 from peft import LoraConfig
 import tptt
 
-# Prevent memory fragmentation in PyTorch during long context training
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 
@@ -245,7 +246,7 @@ def main():
         mag_weight=args.liza_weight,
         cross_gate=args.cross_gate,
         linear_precision="float16" if args.fp16 else "bfloat16",
-        use_linear_checkpoint=False,
+        use_linear_checkpoint=True,
         padding_side=tokenizer.padding_side,
         trust_remote_code=True,
     )
@@ -277,7 +278,8 @@ def main():
         weight_decay=0.01,
         bf16=not args.fp16,
         fp16=args.fp16,
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=500,
