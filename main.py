@@ -184,8 +184,13 @@ def main():
     eval_chunk = list(dataset.take(eval_steps))
     train_chunk = list(dataset.skip(eval_steps).take(args.train_samples))
 
-    eval_dataset = Dataset.from_list(eval_chunk)
-    train_dataset = Dataset.from_list(train_chunk)
+    eval_dataset = Dataset.from_generator(
+        lambda: packed_stream_generator(eval_chunk, tokenizer, args.max_length, args.text_column)
+    )
+
+    train_dataset = Dataset.from_generator(
+        lambda: packed_stream_generator(train_chunk, tokenizer, args.max_length, args.text_column)
+    )
 
     print("✂️ Tokenizing the extracted chunks...")
     column_names = train_dataset.column_names
