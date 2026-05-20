@@ -1,10 +1,16 @@
 import os
-import argparse
-# Prevent memory fragmentation in PyTorch during long context training (must be set before torch import)
+import re
+
+# ==========================================
+# 0. PREVENT MEMORY FRAGMENTATION
+# 🚨 MUST be set before importing PyTorch
+# ==========================================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import argparse
+import psutil
 import torch
-from datasets import load_dataset, IterableDataset, Dataset
+from datasets import load_dataset, Dataset
 from transformers import (
     AutoTokenizer,
     Trainer,
@@ -15,211 +21,208 @@ from transformers import (
 from peft import LoraConfig
 import tptt
 
+# ==========================================
+# Helper: Memory Auto-Sizing
+# ==========================================
+DTYPE_SIZE = {torch.float32: 4, torch.float16: 2, torch.bfloat16: 2}
 
 
+def extract_model_size(base_model: str) -> int:
+    """Estimates the parameter count of a model based on its HF name."""
+    try:
+        if "B" not in base_model.upper(): return 1_000_000_000
+        before_b = base_model.upper().rsplit("B", 1)[0]
+        parts = re.split(r"[^0-9._]", before_b)
+        numbers = [p for p in parts if p.strip()]
+        last_num_str = numbers[-1].replace("_", ".").replace("-", ".")
+        return int(float(last_num_str) * 1_000_000_000)
+    except:
+        return 1_000_000_000
 
+
+def estimate_optimal_batch_size(args, max_batch=64) -> int:
+    """Calculates safe batch size to occupy exactly ~75% of available VRAM."""
+    model_size = extract_model_size(args.model_name)
+    dtype = torch.float16 if args.fp16 else torch.bfloat16
+
+    param_mem_bytes = model_size * DTYPE_SIZE.get(dtype, 2)
+    activation_mem_bytes = 1 * args.max_length * 4 * DTYPE_SIZE.get(dtype, 2) * 20
+
+    if args.use_4bit:
+        param_mem_bytes *= 0.25  # Quantization memory reduction
+
+    optimizer_overhead = param_mem_bytes * 1.2
+    total_mem_bytes = param_mem_bytes + activation_mem_bytes + optimizer_overhead
+
+    # 🚨 Delta Product mathematically requires 2x memory during backward pass
+    if "delta_product" in args.operator_mode:
+        total_mem_bytes *= 2
+
+    total_mem_gb = total_mem_bytes / (1024 ** 3)
+
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        available_mem_gb = props.total_memory / (1024 ** 3)
+    else:
+        available_mem_gb = psutil.virtual_memory().available / (1024 ** 3)
+
+    batch_size = min(max(1, int(0.75 * available_mem_gb // total_mem_gb)), max_batch)
+    print(
+        f"🔥 Auto batch sizing: {batch_size} (Available VRAM: {available_mem_gb:.1f}GB, Est. Base Mem: {total_mem_gb:.1f}GB)")
+    return batch_size
+
+
+# ==========================================
+# Helper: Zero-Padding Sequence Packing
+# ==========================================
 def packed_stream_generator(dataset_stream, tokenizer, max_length, text_column="text"):
-    """
-    Consumes the text stream, tokenizes on the fly,
-    and yields perfectly packed sequences of max_length without padding.
-    """
+    """Yields densely packed sequences of max_length with ZERO padding."""
     buffer = []
-
     for row in dataset_stream:
-        # Extract text and append the EOS token to act as a document boundary
-        text = row[text_column] + tokenizer.eos_token
+        # Fallback dictionary matching
+        if text_column and text_column in row:
+            raw_text = row[text_column]
+        elif "text" in row:
+            raw_text = row["text"]
+        elif "content" in row:
+            raw_text = row["content"]
+        else:
+            raw_text = str(row)
 
-        # Tokenize raw text without padding or truncation
-        # add_special_tokens=False because we manually appended eos_token
+        if not raw_text: continue
+
+        text = raw_text + tokenizer.eos_token
         tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
         buffer.extend(tokens)
 
-        # Once our buffer is larger than max_length, yield a perfect chunk
         while len(buffer) >= max_length:
             chunk = buffer[:max_length]
-            buffer = buffer[max_length:]  # Keep the remainder for the next chunk
-
+            buffer = buffer[max_length:]
             yield {
                 "input_ids": chunk,
                 "labels": chunk.copy(),
-                "attention_mask": [1] * max_length  # All 1s because there is zero padding
+                "attention_mask": [1] * max_length
             }
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="TPTT Training Script")
 
-    # Model & Data Configuration
-    parser.add_argument("--model_name", type=str, required=True,
-                        help="Hugging Face model ID (e.g., Qwen/Qwen2.5-3B, mistralai/Mistral-7B-v0.3)")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="HuggingFace dataset name (e.g., HuggingFaceH4/ultrachat_200k)")
-    parser.add_argument("--dataset_config", type=str, default=None,
-                        help="Dataset config/subset name (e.g., sample-10BT for fineweb-edu)")
-    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split to use for training")
-    parser.add_argument("--train_samples", type=int, default=10000,
-                        help="Number of samples to extract from the stream for training")
-    parser.add_argument("--text_column", type=str, default=None,
-                        help="Explicitly specify the column name containing the text data")
+# ==========================================
+# Helper: Safe Inference Testing
+# ==========================================
+def dummy_generate(model, tokenizer, prompt="The history of artificial intelligence is"):
+    """Tests the model post-training, ensuring the memory cache is flushed first."""
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"\n🤖 Testing generation for prompt: '{prompt}'")
+
+    # 🚨 CRITICAL: Flush recurrent memory states before generating to prevent hallucinations
+    if hasattr(model, "linear_cache"):
+        model.linear_cache.reset()
+    elif hasattr(model, "tptt_model") and hasattr(model.tptt_model, "linear_cache"):
+        model.tptt_model.linear_cache.reset()
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    model.to(device).eval()
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=50, do_sample=False)
+    print("✨ OUTPUT:\n", tokenizer.decode(outputs[0], skip_special_tokens=True))
+    print("=" * 50)
+
+
+# ==========================================
+# CLI Arguments
+# ==========================================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Production TPTT Training Script")
+
+    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--dataset_config", type=str, default=None)
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--train_samples", type=int, default=100_000)
+    parser.add_argument("--text_column", type=str, default="text")
     parser.add_argument("--output_dir", type=str, default="./tptt-trained-model")
 
-    # TPTT Specific Arguments
-    parser.add_argument("--max_length", type=int, default=8192, help="Max sequence length for tokenization")
-    parser.add_argument("--chunk_size", type=int, default=2048,
-                        help="TPTT chunk size (controls VRAM usage, typically 2048 or 4096)")
-    parser.add_argument("--operator_mode", type=str, default="delta_rule",
-                        help="Operator mode for the recurrent memory (e.g., linear, delta_rule)")
-    parser.add_argument("--cross_gate", action="store_true", help="Enable cross gating for memory")
-    parser.add_argument("--liza_weight", type=float, default=0.5, help="Final weight for LiZA curriculum callback")
+    parser.add_argument("--max_length", type=int, default=8192)
+    parser.add_argument("--chunk_size", type=int, default=256, help="Kept small to prevent Delta Product OOM.")
+    parser.add_argument("--operator_mode", type=str, default="delta_rule")
+    parser.add_argument("--cross_gate", action="store_true")
 
-    # Model Agnostic Hardware/Backend Arguments
-    parser.add_argument("--attn_impl", type=str, default="sdpa", choices=["sdpa", "flash_attention_2", "eager"],
-                        help="Attention backend (sdpa is the safest default)")
-    parser.add_argument("--fp16", action="store_true",
-                        help="Use float16 precision instead of bfloat16 (necessary for pre-Ampere GPUs)")
-    parser.add_argument("--use_4bit", action="store_true", help="Use 4-bit quantization (QLoRA)")
+    parser.add_argument("--liza_mode", type=str, default="linear", choices=["constant", "linear", "cyclic"])
+    parser.add_argument("--liza_weight", type=float, default=0.5)
 
-    # LoRA Arguments
-    parser.add_argument("--use_lora", action="store_true", help="Use Parameter Efficient Fine-Tuning (LoRA)")
+    parser.add_argument("--attn_impl", type=str, default="sdpa")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--use_4bit", action="store_true")
+
+    parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=64)
-    parser.add_argument(
-        "--lora_target_modules",
-        nargs="+",
-        default=["q_proj", "k_proj", "v_proj", "o_proj"],
-        help="Space-separated list of base model modules to target. 'memory_gate' and 'mapping_func' are added automatically."
-    )
+    parser.add_argument("--lora_target_modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"])
 
-    # Training Arguments
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=str, default="auto", help="'auto' for automatic VRAM-based sizing")
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max_steps", type=int, default=-1)  # -1 defers to epochs
     parser.add_argument("--lr", type=float, default=2e-4)
 
     return parser.parse_args()
 
 
-def format_and_tokenize(examples, tokenizer, max_length, text_column=None):
-    """Agnostically formats data based on user specification or dataset structure."""
-
-    # 1. User explicitly specified a column
-    if text_column and text_column in examples:
-        texts = examples[text_column]
-
-    # 2. Conversational format (ChatML)
-    elif "messages" in examples:
-        try:
-            texts = [tokenizer.apply_chat_template(msg, tokenize=False) for msg in examples["messages"]]
-        except Exception:
-            # Fallback if tokenizer lacks a chat template
-            texts = ["\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in msg]) for msg in
-                     examples["messages"]]
-
-    # 3. Standard text format
-    elif "text" in examples:
-        texts = examples["text"]
-
-    # 4. Alpaca-style Instruction format
-    elif "instruction" in examples:
-        texts = [
-            f"User: {inst}\n{inp}\nAssistant: {out}" if inp else f"User: {inst}\nAssistant: {out}"
-            for inst, inp, out in
-            zip(examples.get("instruction", []), examples.get("input", [""] * len(examples["instruction"])),
-                examples.get("output", []))
-        ]
-
-    else:
-        raise ValueError(
-            f"Dataset format not recognized. Available columns: {list(examples.keys())}. Please specify --text_column.")
-
-    tokens = tokenizer(
-        texts,
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_attention_mask=True,
-    )
-    # Causal LM expects labels to mirror input_ids
-    tokens["labels"] = tokens["input_ids"].copy()
-    return tokens
-
-
 def main():
     args = parse_args()
-    print(f"🚀 Initializing model-agnostic TPTT training for: {args.model_name}")
+    print(f"🚀 Initializing production TPTT training for: {args.model_name}")
 
     dtype = torch.float16 if args.fp16 else torch.bfloat16
 
+    if args.batch_size.lower() == "auto":
+        actual_batch_size = estimate_optimal_batch_size(args)
+    else:
+        actual_batch_size = int(args.batch_size)
+
     # ==========================================
-    # 1. Load Tokenizer
+    # 1. Tokenizer Setup
     # ==========================================
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-
-    # Agnostic padding fallback logic
     if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        elif tokenizer.unk_token is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    # TPTT relies on causal autoregression, right padding is optimal
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token or "[PAD]"
     tokenizer.padding_side = "right"
 
     # ==========================================
-    # 2. Load and Prepare Dataset (CHUNK EXTRACTION)
+    # 2. Packed Dataset Stream
     # ==========================================
     print(f"🌊 Streaming dataset: {args.dataset}")
-
     dataset_kwargs = {"split": args.dataset_split, "streaming": True}
     if args.dataset_config:
         dataset_kwargs["name"] = args.dataset_config
 
     dataset = load_dataset(args.dataset, **dataset_kwargs)
-
     eval_steps = 500
-    
-    print(f"📦 Extracting a chunk of {args.train_samples} training samples and {eval_steps} eval samples from the stream...")
-    # Take a chunk for eval and a chunk for train
+
+    print(f"✂️ Extracting {args.train_samples} samples and packing perfectly dense sequences (Zero Padding)...")
     eval_chunk = list(dataset.take(eval_steps))
     train_chunk = list(dataset.skip(eval_steps).take(args.train_samples))
 
     eval_dataset = Dataset.from_generator(
         lambda: packed_stream_generator(eval_chunk, tokenizer, args.max_length, args.text_column)
     )
-
     train_dataset = Dataset.from_generator(
         lambda: packed_stream_generator(train_chunk, tokenizer, args.max_length, args.text_column)
     )
 
-
-
     # ==========================================
-    # 3. Configure Quantization & LoRA (PEFT)
+    # 3. LoRA & Quantization Configuration
     # ==========================================
-    bnb_config = None
-    if args.use_4bit:
-        print("🗜️ Configuring 4-bit quantization...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    ) if args.use_4bit else None
 
     lora_config_dict = None
     if args.use_lora:
-        # 1. Target standard pre-trained modules with LoRA
-        lora_targets = set(args.lora_target_modules)
-
-        # 🚨 FIX: Remove the line that forces LoRA onto the custom modules:
-        # lora_targets.update(["memory_gate", "mapping_func"])
-
-        # 2. Fully train the NEW injected TPTT modules without LoRA restrictions
+        # 🚨 FIX: Target the base modules with LoRA, but fully unfreeze and SAVE the injected memory gates!
         modules_to_save = ["memory_gate", "mapping_func"]
-
-        print(f"🔧 Configuring LoRA targeting modules: {list(lora_targets)}")
-        print(f"🔓 Fully unfreezing TPTT modules: {modules_to_save}")
 
         lora_config = LoraConfig(
             r=args.lora_r,
@@ -227,15 +230,15 @@ def main():
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM",
-            target_modules=list(lora_targets),
-            modules_to_save=modules_to_save,  # <-- ADD THIS HERE
+            target_modules=list(set(args.lora_target_modules)),
+            modules_to_save=modules_to_save,
         )
         lora_config_dict = lora_config.to_dict()
 
     # ==========================================
-    # 4. Configure and Initialize TPTT Model
+    # 4. TPTT Model Construction
     # ==========================================
-    print(f"🧠 Injecting TPTT Titanesque architecture into {args.model_name}...")
+    print(f"🧠 Injecting TPTT architecture into {args.model_name}...")
     model_config = tptt.TpttConfig(
         base_model_name=args.model_name,
         operator_mode=args.operator_mode,
@@ -245,7 +248,7 @@ def main():
         mag_weight=args.liza_weight,
         cross_gate=args.cross_gate,
         linear_precision="float16" if args.fp16 else "bfloat16",
-        use_linear_checkpoint=True,
+        use_linear_checkpoint=True,  # 🚨 FIX: Saves massive VRAM on chunks
         padding_side=tokenizer.padding_side,
         trust_remote_code=True,
     )
@@ -258,42 +261,37 @@ def main():
         quantization_config=bnb_config,
     )
 
-    # Resize embeddings in case a new [PAD] token had to be added
     if len(tokenizer) > model.config.vocab_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    # 🚨 FIX: Monkey-patch Gradient Checkpointing for Trainer compatibility
     if hasattr(model, "tptt_model"):
-        # 1. Forward the enable/disable commands to the inner base model
         if hasattr(model.tptt_model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable = model.tptt_model.gradient_checkpointing_enable
         if hasattr(model.tptt_model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable = model.tptt_model.gradient_checkpointing_disable
-
-        # 2. CRITICAL FOR LORA: Ensure frozen base inputs require gradients.
-        # If the Trainer can't find this, PyTorch drops the gradients before they reach your adapters!
         if hasattr(model.tptt_model, "enable_input_require_grads"):
             model.enable_input_require_grads = model.tptt_model.enable_input_require_grads
-
-        # 3. Bypass any older Trainer safety checks
         model.supports_gradient_checkpointing = True
 
     # ==========================================
-    # 5. Setup Training Arguments & Callbacks
+    # 5. Training Arguments
     # ==========================================
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=actual_batch_size,
         gradient_accumulation_steps=args.grad_accum,
-
-        # REMOVE num_train_epochs. ADD max_steps.
-        max_steps=10_000,  # Set this to however many update steps you want to run
-
+        num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         learning_rate=args.lr,
         weight_decay=0.01,
         bf16=not args.fp16,
         fp16=args.fp16,
+
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=False,
+
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=500,
@@ -303,35 +301,57 @@ def main():
         remove_unused_columns=False,
     )
 
-    # Setup LiZA Callback (Memory Gate Curriculum)
     liza_callback = tptt.LiZACallback(
         model=model,
-        mode="linear",
-        initial_weight=0.0,
+        mode=args.liza_mode,
+        initial_weight=0.0 if args.liza_mode == "linear" else args.liza_weight,
         final_weight=args.liza_weight,
         transition_step=500,
+        weight_list=[0.0, 0.5, 1.0],
+        switch_period=1,
     )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator,
+        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         callbacks=[liza_callback],
     )
 
     # ==========================================
-    # 6. Execute Training
+    # 6. Execute & Post-Processing
     # ==========================================
     print("🔥 Starting Training...")
     trainer.train()
 
-    print(f"✅ Training complete. Saving model to {args.output_dir}")
+    print(f"✅ Saving model to {args.output_dir}")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+
+    # 🚨 INTEGRATED from prototype: Model Card Generation
+    print("📝 Generating Model Card...")
+    try:
+        last_log = trainer.state.log_history[-1] if len(trainer.state.log_history) > 0 else {}
+        train_vars = {
+            "batch_size": actual_batch_size,
+            "dataset": args.dataset,
+            "loss": last_log.get("loss", last_log.get("train_loss", "N/A")),
+            "learning_rate": args.lr,
+            "epochs": args.epochs,
+        }
+        tptt.generate_model_card(
+            output_path=args.output_dir,
+            config=model.config,
+            template="model_card_template",
+            extra_variables=train_vars,
+        )
+    except Exception as e:
+        print(f"⚠️ Could not generate model card: {e}")
+
+    # 🚨 INTEGRATED from prototype: Prove inference works post-training!
+    dummy_generate(model, tokenizer)
 
 
 if __name__ == "__main__":
