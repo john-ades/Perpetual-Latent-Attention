@@ -192,20 +192,7 @@ def main():
         lambda: packed_stream_generator(train_chunk, tokenizer, args.max_length, args.text_column)
     )
 
-    print("✂️ Tokenizing the extracted chunks...")
-    column_names = train_dataset.column_names
 
-    eval_dataset = eval_dataset.map(
-        lambda x: format_and_tokenize(x, tokenizer, args.max_length, args.text_column),
-        batched=True,
-        remove_columns=column_names
-    )
-
-    train_dataset = train_dataset.map(
-        lambda x: format_and_tokenize(x, tokenizer, args.max_length, args.text_column),
-        batched=True,
-        remove_columns=column_names
-    )
 
     # ==========================================
     # 3. Configure Quantization & LoRA (PEFT)
